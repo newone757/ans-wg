@@ -39,7 +39,7 @@ An **Ansible playbook** for setting up a provate **Wireguard mesh network** . Th
     ```
 5.  **Run the playbook**: Execute the playbook with the inventory file to begin the automated setup:
     ```bash
-    ansible-playbook -i inventory.yml wireguard.yml
+    ansible-playbook -i inventory.yml wireguard-ansible.yml --ask-vault-pass
     ```
 
 ---
