@@ -1,0 +1,188 @@
+---
+
+# Test with control node (default)
+# ansible-playbook test-wireguard.yml --ask-vault-pass
+
+# Test without control node
+# ansible-playbook test-wireguard.yml --ask-vault-pass -e "include_control_node=false"
+
+- name: Test Wireguard Mesh Network
+  hosts: wireguard_nodes
+  become: no
+  gather_facts: yes
+  vars:
+    # Test configuration
+    include_control_node: true
+    wireguard_interface: wg0
+    test_duration: 10  # seconds for speed tests
+    
+  tasks:
+    - name: Check Wireguard status on all nodes
+      shell: sudo wg show
+      register: wg_status
+      changed_when: false
+
+    - name: Display Wireguard status
+      debug:
+        msg: 
+          - "=== {{ inventory_hostname }} Wireguard Status ==="
+          - "{{ wg_status.stdout_lines }}"
+
+    - name: Get Wireguard interface IP
+      shell: ip addr show {{ wireguard_interface }} | grep 'inet ' | awk '{print $2}' | cut -d/ -f1
+      register: node_wg_ip
+      changed_when: false
+
+    - name: Store node IP for testing
+      set_fact:
+        my_wg_ip: "{{ node_wg_ip.stdout }}"
+
+    - name: Build test IP list based on configuration
+      set_fact:
+        # If control node included: test IPs are 10.0.0.1, 10.0.0.2, 10.0.0.3, 10.0.0.4
+        # If control node excluded: test IPs are 10.0.0.1, 10.0.0.2, 10.0.0.3
+        test_ips: "{{ ['10.0.0.1', '10.0.0.2', '10.0.0.3', '10.0.0.4'] if include_control_node else ['10.0.0.1', '10.0.0.2', '10.0.0.3'] }}"
+
+    - name: Test connectivity from each node to all others
+      shell: |
+        echo "Testing connectivity from {{ my_wg_ip }}:"
+        success=0
+        total=0
+        for ip in {{ test_ips | join(' ') }}; do
+          if [ "$ip" != "{{ my_wg_ip }}" ]; then
+            total=$((total + 1))
+            if ping -c 3 -W 2 $ip > /dev/null 2>&1; then
+              echo "✓ $ip - REACHABLE"
+              success=$((success + 1))
+            else
+              echo "✗ $ip - UNREACHABLE"
+            fi
+          fi
+        done
+        echo "Result: $success/$total nodes reachable"
+      register: connectivity_test
+      changed_when: false
+
+    - name: Display connectivity results
+      debug:
+        msg:
+          - "=== {{ inventory_hostname }} ({{ my_wg_ip }}) Connectivity Test ==="
+          - "{{ connectivity_test.stdout_lines }}"
+
+    - name: Install iperf3 if not present (on first server only)
+      package:
+        name: iperf3
+        state: present
+      become: yes
+      when: inventory_hostname == ansible_play_hosts[0]
+
+    - name: Start iperf3 server on first node
+      shell: |
+        pkill iperf3 2>/dev/null || true
+        sleep 1
+        iperf3 -s -D -B {{ my_wg_ip }} -p 5201
+        echo "Started iperf3 server on {{ my_wg_ip }}:5201"
+      when: inventory_hostname == ansible_play_hosts[0]
+      register: iperf_server
+      changed_when: false
+
+    - name: Wait for iperf3 server to start
+      wait_for:
+        timeout: 3
+      when: inventory_hostname == ansible_play_hosts[0]
+
+    - name: Test network speed between nodes
+      shell: |
+        server_ip="{{ hostvars[ansible_play_hosts[0]]['my_wg_ip'] }}"
+        if [ "{{ my_wg_ip }}" != "$server_ip" ]; then
+          echo "=== Speed Test: {{ my_wg_ip }} → $server_ip ==="
+          timeout 15 iperf3 -c $server_ip -t {{ test_duration }} -f M -p 5201 | grep -E "(Mbits/sec|sender|receiver)" | tail -3 || echo "Speed test failed or timed out"
+        else
+          echo "=== Speed Test: Skipped (this is the iperf3 server) ==="
+        fi
+      register: speed_test
+      changed_when: false
+      when: inventory_hostname != ansible_play_hosts[0]
+
+    - name: Display speed test results
+      debug:
+        msg: "{{ speed_test.stdout_lines }}"
+      when: inventory_hostname != ansible_play_hosts[0]
+
+    - name: Clean up iperf3 server
+      shell: pkill iperf3 || true
+      when: inventory_hostname == ansible_play_hosts[0]
+      failed_when: false
+      changed_when: false
+
+    - name: Test control node connectivity if enabled
+      block:
+        - name: Test connectivity from control node
+          shell: |
+            echo "=== Control Node (10.0.0.1) Connectivity Test ==="
+            success=0
+            total=0
+            for ip in {{ test_ips | difference(['10.0.0.1']) | join(' ') }}; do
+              total=$((total + 1))
+              if ping -c 3 -W 2 $ip > /dev/null 2>&1; then
+                echo "✓ $ip - REACHABLE"
+                success=$((success + 1))
+              else
+                echo "✗ $ip - UNREACHABLE" 
+              fi
+            done
+            echo "Result: $success/$total servers reachable from control node"
+          register: control_connectivity
+          changed_when: false
+          delegate_to: localhost
+          become: no
+
+        - name: Display control node connectivity
+          debug:
+            msg: "{{ control_connectivity.stdout_lines }}"
+          delegate_to: localhost
+
+        - name: Check control node Wireguard status
+          shell: sudo wg show
+          register: control_wg_status
+          changed_when: false
+          delegate_to: localhost
+          become: yes
+
+        - name: Display control node Wireguard status
+          debug:
+            msg:
+              - "=== Control Node Wireguard Status ==="
+              - "{{ control_wg_status.stdout_lines }}"
+          delegate_to: localhost
+      when: include_control_node
+      run_once: true
+
+    - name: Generate connectivity summary
+      debug:
+        msg:
+          - "========================================="
+          - "         WIREGUARD MESH TEST SUMMARY"
+          - "========================================="
+          - "Configuration: {{ 'Control node included' if include_control_node else 'Servers only' }}"
+          - "Total test IPs: {{ test_ips | length }}"
+          - "Test IPs: {{ test_ips | join(', ') }}"
+          - ""
+          - "✓ Check individual node results above"
+          - "✓ Look for 'REACHABLE' status for each connection"
+          - "✓ Review speed test results between nodes"
+          - "========================================="
+      run_once: true
+
+    - name: Security verification - check firewall status
+      shell: sudo ufw status numbered
+      register: firewall_status
+      changed_when: false
+      when: ansible_os_family == "Debian"
+
+    - name: Display firewall status
+      debug:
+        msg:
+          - "=== {{ inventory_hostname }} UFW Firewall Status ==="
+          - "{{ firewall_status.stdout_lines }}"
+      when: ansible_os_family == "Debian" and firewall_status is defined
