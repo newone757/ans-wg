@@ -1,0 +1,19 @@
+# File: templates/wg0.conf.j2
+[Interface]
+PrivateKey = {{ node_private_key }}
+Address = {{ node_ip }}/24
+ListenPort = {{ wireguard_port }}
+SaveConfig = false
+
+{% for node in all_nodes | default([]) %}
+{% if node.hostname != inventory_hostname %}
+[Peer]
+PublicKey = {{ node.public_key }}
+AllowedIPs = {{ node.ip }}/32
+{% if node.hostname != 'control-node' %}
+Endpoint = {{ node.ansible_host }}:{{ wireguard_port }}
+{% endif %}
+PersistentKeepalive = 25
+
+{% endif %}
+{% endfor %}

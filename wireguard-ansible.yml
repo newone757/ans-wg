@@ -1,0 +1,437 @@
+---
+- name: Setup Wireguard Mesh Network
+  hosts: wireguard_nodes
+  become: yes
+  gather_facts: yes
+  vars:
+    # Wireguard Configuration
+    wireguard_port: 51820
+    wireguard_interface: wg0
+    wireguard_network: "10.0.0.0/24"
+    
+    # Include control node in the network (set to false to exclude)
+    include_control_node: true
+    
+    # UFW Configuration - RESTRICTIVE FIREWALL (denies all except SSH and Wireguard)
+    enable_ufw: true
+    
+    # Internal variables (don't modify)
+    wireguard_config_dir: "/etc/wireguard"
+    wireguard_keys_dir: "/etc/wireguard/keys"
+    
+  tasks:
+    - name: Update package cache (Ubuntu/Debian)
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+      when: ansible_os_family == "Debian"
+      
+    - name: Update package cache (CentOS/RHEL)
+      yum:
+        update_cache: yes
+      when: ansible_os_family == "RedHat"
+
+    - name: Install required packages (Ubuntu/Debian)
+      apt:
+        name:
+          - wireguard
+          - wireguard-tools
+          - ufw
+          - net-tools
+        state: present
+      when: ansible_os_family == "Debian"
+      
+    - name: Install EPEL repository (CentOS/RHEL)
+      yum:
+        name: epel-release
+        state: present
+      when: ansible_os_family == "RedHat"
+      
+    - name: Install required packages (CentOS/RHEL)
+      yum:
+        name:
+          - wireguard-tools
+          - firewalld
+          - net-tools
+        state: present
+      when: ansible_os_family == "RedHat"
+
+    - name: Create wireguard directories
+      file:
+        path: "{{ item }}"
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+      loop:
+        - "{{ wireguard_config_dir }}"
+        - "{{ wireguard_keys_dir }}"
+
+    - name: Check if wg command exists
+      command: which wg
+      register: wg_exists
+      failed_when: false
+      changed_when: false
+
+    - name: Generate private key for each node (if wg exists)
+      shell: wg genkey
+      register: private_key
+      changed_when: true
+      when: wg_exists.rc == 0
+
+    - name: Generate fake private key for check mode
+      set_fact:
+        private_key: 
+          stdout: "fake_private_key_{{ inventory_hostname }}_{{ ansible_date_time.epoch }}"
+      when: wg_exists.rc != 0
+
+    - name: Generate public key from private key (if wg exists)
+      shell: echo "{{ private_key.stdout }}" | wg pubkey
+      register: public_key
+      changed_when: false
+      when: wg_exists.rc == 0
+
+    - name: Generate fake public key for check mode
+      set_fact:
+        public_key:
+          stdout: "fake_public_key_{{ inventory_hostname }}_{{ ansible_date_time.epoch }}"
+      when: wg_exists.rc != 0
+
+    - name: Calculate IP addresses based on control node inclusion
+      set_fact:
+        # If control node included: control=10.0.0.1, servers start at 10.0.0.2
+        # If control node excluded: servers start at 10.0.0.1
+        server_ip_offset: "{{ 2 if include_control_node else 1 }}"
+        control_node_ip_value: "10.0.0.1"
+
+    - name: Store keys and IP for each node
+      set_fact:
+        node_private_key: "{{ private_key.stdout }}"
+        node_public_key: "{{ public_key.stdout }}"
+        node_ip: "{{ '10.0.0.' + (ansible_play_hosts.index(inventory_hostname) + server_ip_offset | int) | string }}"
+
+    # Collect server information
+    - name: Collect server information
+      set_fact:
+        my_node_info:
+          hostname: "{{ inventory_hostname }}"
+          public_key: "{{ node_public_key }}"
+          ip: "{{ node_ip }}"
+          ansible_host: "{{ ansible_host }}"
+
+    # Build the complete node list
+    - name: Initialize node collection
+      add_host:
+        name: "temp_storage"
+        groups: "temp_group"
+        all_server_nodes: "{{ ansible_play_hosts | map('extract', hostvars) | selectattr('my_node_info', 'defined') | map(attribute='my_node_info') | list }}"
+      run_once: true
+      delegate_to: localhost
+
+    - name: Generate control node keys if enabled
+      block:
+        - name: Check if wg command exists on localhost
+          command: which wg
+          register: control_wg_exists
+          failed_when: false
+          changed_when: false
+
+        - name: Generate control node private key (if wg exists)
+          shell: wg genkey
+          register: control_private_key
+          changed_when: true
+          when: control_wg_exists.rc == 0
+
+        - name: Generate fake control node private key for check mode
+          set_fact:
+            control_private_key:
+              stdout: "fake_control_private_key_{{ ansible_date_time.epoch }}"
+          when: control_wg_exists.rc != 0
+
+        - name: Generate control node public key (if wg exists)
+          shell: echo "{{ control_private_key.stdout }}" | wg pubkey
+          register: control_public_key_result
+          changed_when: false
+          when: control_wg_exists.rc == 0
+
+        - name: Generate fake control node public key for check mode
+          set_fact:
+            control_public_key_result:
+              stdout: "fake_control_public_key_{{ ansible_date_time.epoch }}"
+          when: control_wg_exists.rc != 0
+
+        - name: Store control node information
+          set_fact:
+            control_node_private_key: "{{ control_private_key.stdout }}"
+            control_node_public_key: "{{ control_public_key_result.stdout }}"
+            control_node_ip: "{{ control_node_ip_value }}"
+
+        - name: Add control node to temp storage
+          add_host:
+            name: "temp_storage"
+            all_nodes: "{{ hostvars['temp_storage']['all_server_nodes'] + [{'hostname': 'control-node', 'public_key': control_node_public_key, 'ip': control_node_ip, 'ansible_host': 'localhost'}] }}"
+      when: include_control_node
+      run_once: true
+      delegate_to: localhost
+
+    - name: Set all_nodes without control node if disabled
+      add_host:
+        name: "temp_storage"
+        all_nodes: "{{ hostvars['temp_storage']['all_server_nodes'] }}"
+      when: not include_control_node
+      run_once: true
+      delegate_to: localhost
+
+    - name: Get final all_nodes list
+      set_fact:
+        all_nodes: "{{ hostvars['temp_storage']['all_nodes'] }}"
+
+    - name: Debug - Show all nodes in mesh network
+      debug:
+        msg: 
+          - "Include control node: {{ include_control_node }}"
+          - "Total nodes in mesh: {{ all_nodes | length }}"
+          - "Node IPs: {{ all_nodes | map(attribute='ip') | list }}"
+          - "Nodes: {{ all_nodes | map(attribute='hostname') | list }}"
+      run_once: true
+
+    - name: Create Wireguard configuration file for servers
+      template:
+        src: wg0.conf.j2
+        dest: "{{ wireguard_config_dir }}/{{ wireguard_interface }}.conf"
+        mode: '0600'
+        owner: root
+        group: root
+      notify: restart wireguard
+
+    - name: Create control node Wireguard directory if enabled
+      file:
+        path: "{{ wireguard_config_dir }}"
+        state: directory
+        mode: '0700'
+        owner: root
+        group: root
+      when: include_control_node
+      run_once: true
+      delegate_to: localhost
+      become: yes
+
+    - name: Create control node Wireguard config if enabled
+      template:
+        src: wg0.conf.j2
+        dest: "{{ wireguard_config_dir }}/{{ wireguard_interface }}.conf"
+        mode: '0600'
+        owner: root
+        group: root
+      vars:
+        node_private_key: "{{ hostvars['temp_storage']['control_node_private_key'] }}"
+        node_ip: "{{ hostvars['temp_storage']['control_node_ip'] }}"
+        inventory_hostname: 'control-node'
+      when: include_control_node
+      run_once: true
+      delegate_to: localhost
+      become: yes
+
+    - name: Enable IP forwarding
+      sysctl:
+        name: net.ipv4.ip_forward
+        value: '1'
+        state: present
+        sysctl_set: yes
+        reload: yes
+
+    - name: Enable IPv6 forwarding
+      sysctl:
+        name: net.ipv6.conf.all.forwarding
+        value: '1'
+        state: present
+        sysctl_set: yes
+        reload: yes
+
+    - name: Configure UFW (Ubuntu/Debian)
+      block:
+        - name: Reset UFW to defaults
+          ufw:
+            state: reset
+          
+        - name: Set UFW default policies
+          ufw:
+            policy: "{{ item.policy }}"
+            direction: "{{ item.direction }}"
+          loop:
+            - { direction: 'incoming', policy: 'deny' }
+            - { direction: 'outgoing', policy: 'allow' }
+            - { direction: 'routed', policy: 'allow' }
+
+        - name: Allow SSH through UFW (before enabling UFW)
+          ufw:
+            rule: allow
+            port: "{{ ansible_port | default('22') }}"
+            proto: tcp
+            comment: "SSH - Ansible management"
+
+        - name: Allow Wireguard port through UFW
+          ufw:
+            rule: allow
+            port: "{{ wireguard_port }}"
+            proto: udp
+            comment: "Wireguard VPN"
+
+        - name: Allow all traffic on Wireguard interface (incoming)
+          ufw:
+            rule: allow
+            interface_in: "{{ wireguard_interface }}"
+            comment: "Wireguard interface - incoming traffic"
+
+        - name: Allow all traffic on Wireguard interface (outgoing)
+          ufw:
+            rule: allow
+            interface_out: "{{ wireguard_interface }}"
+            comment: "Wireguard interface - outgoing traffic"
+
+        - name: Allow loopback traffic
+          ufw:
+            rule: allow
+            interface_in: lo
+            comment: "Loopback interface"
+
+        - name: Enable UFW with restrictive rules
+          ufw:
+            state: enabled
+            logging: 'on'
+
+        - name: Display UFW status
+          shell: ufw status verbose
+          register: ufw_status
+          changed_when: false
+
+        - name: Show UFW configuration
+          debug:
+            msg: "{{ ufw_status.stdout_lines }}"
+      when: ansible_os_family == "Debian" and enable_ufw
+
+    - name: Configure firewalld (CentOS/RHEL)
+      block:
+        - name: Set firewalld default zone to drop (restrictive)
+          firewalld:
+            zone: drop
+            state: enabled
+            permanent: yes
+            immediate: yes
+
+        - name: Create custom Wireguard zone
+          firewalld:
+            zone: wireguard
+            state: present
+            permanent: yes
+            immediate: yes
+
+        - name: Allow SSH in public zone
+          firewalld:
+            zone: public
+            port: "{{ ansible_port | default('22') }}/tcp"
+            permanent: yes
+            immediate: yes
+            state: enabled
+
+        - name: Allow Wireguard port in public zone
+          firewalld:
+            zone: public
+            port: "{{ wireguard_port }}/udp"
+            permanent: yes
+            immediate: yes
+            state: enabled
+
+        - name: Allow all traffic on Wireguard interface in custom zone
+          firewalld:
+            zone: wireguard
+            interface: "{{ wireguard_interface }}"
+            permanent: yes
+            immediate: yes
+            state: enabled
+
+        - name: Set masquerade for Wireguard zone
+          firewalld:
+            zone: wireguard
+            masquerade: yes
+            permanent: yes
+            immediate: yes
+            state: enabled
+
+        - name: Reload firewalld configuration
+          systemd:
+            name: firewalld
+            state: reloaded
+
+        - name: Display firewalld status
+          shell: firewall-cmd --list-all-zones
+          register: firewalld_status
+          changed_when: false
+
+        - name: Show firewalld configuration
+          debug:
+            msg: "{{ firewalld_status.stdout_lines }}"
+      when: ansible_os_family == "RedHat"
+
+    - name: Try to enable and start Wireguard service
+      systemd:
+        name: "wg-quick@{{ wireguard_interface }}"
+        enabled: yes
+        state: started
+        daemon_reload: yes
+      register: wg_service_result
+      failed_when: false
+
+    - name: Start Wireguard manually if service doesn't exist
+      shell: wg-quick up {{ wireguard_interface }}
+      when: wg_service_result.failed and not ansible_check_mode
+      register: manual_start
+      failed_when: manual_start.rc != 0 and "already exists" not in manual_start.stderr
+
+    - name: Try to enable Wireguard service for boot (ignore if fails)
+      systemd:
+        name: "wg-quick@{{ wireguard_interface }}"
+        enabled: yes
+        daemon_reload: yes
+      failed_when: false
+
+    - name: Start control node Wireguard if enabled
+      shell: wg-quick up {{ wireguard_interface }}
+      when: include_control_node and not ansible_check_mode
+      run_once: true
+      delegate_to: localhost
+      become: yes
+      register: control_wg_start
+      failed_when: control_wg_start.rc != 0 and "already exists" not in control_wg_start.stderr
+
+    - name: Verify Wireguard is running on servers
+      shell: wg show
+      register: wg_status
+      changed_when: false
+      when: not ansible_check_mode
+
+    - name: Display Wireguard status for each server
+      debug:
+        msg: "{{ inventory_hostname }} Wireguard status: {{ wg_status.stdout_lines | default(['Not running - check mode or service not started']) }}"
+
+    - name: Show control node Wireguard status if enabled
+      shell: wg show
+      register: control_wg_status
+      when: include_control_node and not ansible_check_mode
+      run_once: true
+      delegate_to: localhost
+      become: yes
+      changed_when: false
+
+    - name: Display control node Wireguard status
+      debug:
+        msg: "control-node Wireguard status: {{ control_wg_status.stdout_lines | default(['Not running - check mode or service not started']) }}"
+      when: include_control_node
+      run_once: true
+
+  handlers:
+    - name: restart wireguard
+      systemd:
+        name: "wg-quick@{{ wireguard_interface }}"
+        state: restarted
+      failed_when: false

@@ -1,0 +1,29 @@
+---
+# File: inventory.yml
+all:
+  children:
+    wireguard_nodes:
+      hosts:
+        server1:
+          ansible_host: 10.0.1.111
+          ansible_port: 2089
+          ansible_ssh_private_key_file: ~/.ssh/vps_management_key
+        server2:
+          ansible_host: 10.0.1.112
+          ansible_port: 2089
+          ansible_ssh_private_key_file: ~/.ssh/vps_management_key
+        server3:
+          ansible_host: 10.0.1.113
+          ansible_port: 2089
+          ansible_ssh_private_key_file: ~/.ssh/vps_management_key
+        server4:
+          ansible_host: 10.0.1.114
+          ansible_port: 2089
+          ansible_ssh_private_key_file: ~/.ssh/vps_management_key
+      vars:
+        ansible_user: local
+        ansible_become: yes
+        ansible_become_method: sudo
+        ansible_become_password: "{{ vault_sudo_password }}"
+        wireguard_port: 51820
+        include_control_node: true
